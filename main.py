@@ -18,7 +18,7 @@ BOT_TOKEN = str(os.environ.get("TOKEN"))
 ADMIN_ID = 5301117772
 
 # Инициализация бота и диспетчера
-bot = Bot(token=BOT_TOKEN)
+bot = Bot(token=str(BOT_TOKEN))
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 router = Router()
@@ -1058,4 +1058,5 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
