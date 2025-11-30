@@ -13,7 +13,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
 # Настройки бота
-BOT_TOKEN = "8314785765:AAHVL5d66C5w1O8PQXQ1X0zHssBdLrpy3vI"
+BOT_TOKEN = "8314785765:AAE7kyzLlu3IJ8boo0gE_O5crUZtp9juUEM"
 ADMIN_ID = 5301117772
 
 # Инициализация бота и диспетчера
@@ -1056,4 +1056,5 @@ async def main():
 
 
 if __name__ == "__main__":
+
     asyncio.run(main())
