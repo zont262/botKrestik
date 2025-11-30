@@ -1,7 +1,7 @@
 import asyncio
 import random
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 import os
 
@@ -13,7 +13,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
 # Настройки бота
-BOT_TOKEN = str(os.environ.get("TOKEN"))
+BOT_TOKEN = os.environ.get("TOKEN")
+#BOT_TOKEN = "6324958627:AAE7rRC-AUHod4sFWXrz-JQLUjb2eh_1hyQ"
 
 ADMIN_ID = 5301117772
 
@@ -23,6 +24,18 @@ storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 router = Router()
 dp.include_router(router)
+
+# Реферальная система - константы
+REF_REQUIRED_GAMES = 3
+REF_REQUIRED_RANK = "Любитель"
+REF_FOR_ROULETTE = 10
+STATUSES = [
+    "Путь", "Рост", "Цель", "Форсаж", "Бросок", "Вершина", "Легенда", "Тактик",
+    "Гений", "Стихия", "Ход", "Калькулятор", "Блиц", "Вызов", "Вихрь", "Феникс",
+    "Азарт", "Дзен", "Искра", "Гравитация", "Рок", "Крест", "Ноль", "Поле",
+    "Пат", "Матч", "Титан", "Воля", "Упорство", "Взлёт"
+]
+DEFAULT_STATUS = "без статуса"
 
 
 def get_db_connection():
@@ -39,12 +52,14 @@ def init_db():
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             username TEXT,
-            rating INTEGER DEFAULT 100,
+            rating INTEGER DEFAULT 0,
             games_played INTEGER DEFAULT 0,
             wins INTEGER DEFAULT 0,
             losses INTEGER DEFAULT 0,
             draws INTEGER DEFAULT 0,
-            registered_at TEXT
+            registered_at TEXT,
+            last_game_at TEXT,
+            is_blocked BOOLEAN DEFAULT FALSE
         )
     ''')
 
@@ -73,7 +88,7 @@ def init_db():
         )
     ''')
 
-    # Таблица приглашений - обновленная структура
+    # Таблица приглашений
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS invites (
             inviter_id INTEGER,
@@ -81,6 +96,51 @@ def init_db():
             created_at TEXT,
             used BOOLEAN DEFAULT FALSE,
             used_by INTEGER DEFAULT NULL
+        )
+    ''')
+
+    # Таблица рассылок
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS broadcasts (
+            broadcast_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sent_at TEXT,
+            success_count INTEGER,
+            fail_count INTEGER
+        )
+    ''')
+
+    # Таблица рефералов
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS referrals (
+            referrer_id INTEGER,
+            referred_id INTEGER,
+            games_played INTEGER DEFAULT 0,
+            is_completed BOOLEAN DEFAULT FALSE,
+            created_at TEXT,
+            PRIMARY KEY (referrer_id, referred_id)
+        )
+    ''')
+
+    # Таблица инвентаря
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS inventory (
+            user_id INTEGER,
+            item_type TEXT,
+            item_name TEXT,
+            quantity INTEGER DEFAULT 1,
+            obtained_at TEXT,
+            PRIMARY KEY (user_id, item_type, item_name)
+        )
+    ''')
+
+    # Таблица статусов
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS user_statuses (
+            user_id INTEGER,
+            status_name TEXT,
+            is_active BOOLEAN DEFAULT FALSE,
+            obtained_at TEXT,
+            PRIMARY KEY (user_id, status_name)
         )
     ''')
 
@@ -94,44 +154,62 @@ def upgrade_db():
     cursor = conn.cursor()
 
     try:
-        # Проверяем существование таблицы invites
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='invites'")
+        # Проверяем существование таблицы users и добавляем новые колонки
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='users'")
         if cursor.fetchone():
-            # Проверяем существование колонки 'used'
-            cursor.execute("PRAGMA table_info(invites)")
+            cursor.execute("PRAGMA table_info(users)")
             columns = [column[1] for column in cursor.fetchall()]
 
-            if 'used' not in columns:
-                print("Обновляю структуру таблицы invites...")
-                # Создаем временную таблицу с новой структурой
-                cursor.execute('''
-                    CREATE TABLE invites_new (
-                        inviter_id INTEGER,
-                        invite_code TEXT PRIMARY KEY,
-                        created_at TEXT,
-                        used BOOLEAN DEFAULT FALSE,
-                        used_by INTEGER DEFAULT NULL
-                    )
-                ''')
+            # Добавляем недостающие колонки
+            if 'last_game_at' not in columns:
+                cursor.execute('ALTER TABLE users ADD COLUMN last_game_at TEXT')
+            if 'is_blocked' not in columns:
+                cursor.execute('ALTER TABLE users ADD COLUMN is_blocked BOOLEAN DEFAULT FALSE')
 
-                # Копируем данные из старой таблицы если они есть
-                try:
-                    cursor.execute('''
-                        INSERT INTO invites_new (inviter_id, invite_code, created_at)
-                        SELECT inviter_id, invite_code, created_at FROM invites
-                    ''')
-                except Exception as e:
-                    print(f"Ошибка при копировании данных: {e}")
+        # Создаем таблицу broadcasts если не существует
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS broadcasts (
+                broadcast_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sent_at TEXT,
+                success_count INTEGER,
+                fail_count INTEGER
+            )
+        ''')
 
-                # Удаляем старую таблицу и переименовываем новую
-                cursor.execute('DROP TABLE IF EXISTS invites')
-                cursor.execute('ALTER TABLE invites_new RENAME TO invites')
+        # Создаем таблицу referrals если не существует
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS referrals (
+                referrer_id INTEGER,
+                referred_id INTEGER,
+                games_played INTEGER DEFAULT 0,
+                is_completed BOOLEAN DEFAULT FALSE,
+                created_at TEXT,
+                PRIMARY KEY (referrer_id, referred_id)
+            )
+        ''')
 
-                print("Структура таблицы invites успешно обновлена!")
-            else:
-                print("Таблица invites уже имеет актуальную структуру")
-        else:
-            print("Таблица invites не существует, будет создана при инициализации")
+        # Создаем таблицу inventory если не существует
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS inventory (
+                user_id INTEGER,
+                item_type TEXT,
+                item_name TEXT,
+                quantity INTEGER DEFAULT 1,
+                obtained_at TEXT,
+                PRIMARY KEY (user_id, item_type, item_name)
+            )
+        ''')
+
+        # Создаем таблицу user_statuses если не существует
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_statuses (
+                user_id INTEGER,
+                status_name TEXT,
+                is_active BOOLEAN DEFAULT FALSE,
+                obtained_at TEXT,
+                PRIMARY KEY (user_id, status_name)
+            )
+        ''')
 
     except Exception as e:
         print(f"Ошибка при обновлении базы данных: {e}")
@@ -175,6 +253,12 @@ class SMSStates(StatesGroup):
     waiting_video = State()
     waiting_gif = State()
     waiting_buttons = State()
+
+
+class AdminStates(StatesGroup):
+    waiting_username_for_block = State()
+    waiting_username_for_unblock = State()
+    waiting_stats_period = State()
 
 
 class TicTacToeGame:
@@ -248,6 +332,10 @@ class TicTacToeGame:
                 else:
                     row.append(InlineKeyboardButton(text=self.board[i][j], callback_data="empty"))
             keyboard.append(row)
+
+        # Добавляем кнопку "Сдаться"
+        keyboard.append([InlineKeyboardButton(text="🏳️ Сдаться", callback_data="surrender")])
+
         return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
     def save_to_db(self, game_id: str):
@@ -291,7 +379,7 @@ def get_global_ranking() -> List[Tuple[int, str, int]]:
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    cursor.execute('SELECT user_id, username, rating FROM users ORDER BY rating DESC LIMIT 10')
+    cursor.execute('SELECT user_id, username, rating FROM users WHERE is_blocked = FALSE ORDER BY rating DESC LIMIT 10')
     ranked_users = cursor.fetchall()
 
     conn.close()
@@ -302,7 +390,7 @@ def get_user_position(user_id: int) -> int:
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    cursor.execute('SELECT user_id, rating FROM users ORDER BY rating DESC')
+    cursor.execute('SELECT user_id, rating FROM users WHERE is_blocked = FALSE ORDER BY rating DESC')
     ranked_users = cursor.fetchall()
 
     conn.close()
@@ -331,7 +419,9 @@ def get_user_data(user_id: int) -> dict:
             'wins': user[4],
             'losses': user[5],
             'draws': user[6],
-            'registered_at': user[7]
+            'registered_at': user[7],
+            'last_game_at': user[8],
+            'is_blocked': bool(user[9]) if user[9] is not None else False
         }
     return None
 
@@ -342,16 +432,25 @@ def save_user_data(user_data: dict):
 
     cursor.execute('''
         INSERT OR REPLACE INTO users 
-        (user_id, username, rating, games_played, wins, losses, draws, registered_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        (user_id, username, rating, games_played, wins, losses, draws, registered_at, last_game_at, is_blocked)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', (
         user_data['user_id'], user_data['username'], user_data['rating'],
         user_data['games_played'], user_data['wins'], user_data['losses'],
-        user_data['draws'], user_data['registered_at']
+        user_data['draws'], user_data['registered_at'],
+        user_data.get('last_game_at'), user_data.get('is_blocked', False)
     ))
 
     conn.commit()
     conn.close()
+
+
+def update_last_game_time(user_id: int):
+    """Обновляет время последней игры пользователя"""
+    user_data = get_user_data(user_id)
+    if user_data:
+        user_data['last_game_at'] = datetime.now().isoformat()
+        save_user_data(user_data)
 
 
 def save_chat_info(chat_id: int, chat_type: str, title: str = None, members_count: int = 0):
@@ -377,6 +476,109 @@ def get_all_chats():
 
     conn.close()
     return chats
+
+
+def get_all_users():
+    """Получает всех пользователей"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute('SELECT user_id FROM users WHERE is_blocked = FALSE')
+    users = [row[0] for row in cursor.fetchall()]
+
+    conn.close()
+    return users
+
+
+def get_inactive_users(hours: int = 24):
+    """Получает пользователей, которые не играли более указанных часов"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cutoff_time = (datetime.now() - timedelta(hours=hours)).isoformat()
+
+    cursor.execute('''
+        SELECT user_id, username, last_game_at 
+        FROM users 
+        WHERE is_blocked = FALSE AND (last_game_at IS NULL OR last_game_at < ?)
+    ''', (cutoff_time,))
+
+    users = cursor.fetchall()
+    conn.close()
+    return users
+
+
+def get_stats(period_hours: int):
+    """Получает статистику за указанный период"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cutoff_time = (datetime.now() - timedelta(hours=period_hours)).isoformat()
+
+    # Новые пользователи
+    cursor.execute('SELECT COUNT(*) FROM users WHERE registered_at > ? AND is_blocked = FALSE', (cutoff_time,))
+    new_users = cursor.fetchone()[0]
+
+    # Количество игр
+    cursor.execute('SELECT COUNT(*) FROM game_sessions WHERE created_at > ?', (cutoff_time,))
+    games_played = cursor.fetchone()[0]
+
+    # Неактивные пользователи
+    cursor.execute('SELECT COUNT(*) FROM users WHERE last_game_at < ? AND is_blocked = FALSE', (cutoff_time,))
+    inactive_users = cursor.fetchone()[0]
+
+    # Новые чаты
+    cursor.execute('SELECT COUNT(*) FROM bot_chats WHERE added_at > ?', (cutoff_time,))
+    new_chats = cursor.fetchone()[0]
+
+    conn.close()
+
+    return {
+        'new_users': new_users,
+        'games_played': games_played,
+        'inactive_users': inactive_users,
+        'new_chats': new_chats
+    }
+
+
+def block_user(username: str):
+    """Блокирует пользователя по username"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute('UPDATE users SET is_blocked = TRUE WHERE username = ?', (username,))
+    success = cursor.rowcount > 0
+
+    conn.commit()
+    conn.close()
+    return success
+
+
+def unblock_user(username: str):
+    """Разблокирует пользователя по username"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute('UPDATE users SET is_blocked = FALSE WHERE username = ?', (username,))
+    success = cursor.rowcount > 0
+
+    conn.commit()
+    conn.close()
+    return success
+
+
+def save_broadcast_stats(success_count: int, fail_count: int):
+    """Сохраняет статистику рассылки"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute('''
+        INSERT INTO broadcasts (sent_at, success_count, fail_count)
+        VALUES (?, ?, ?)
+    ''', (datetime.now().isoformat(), success_count, fail_count))
+
+    conn.commit()
+    conn.close()
 
 
 def create_invite(inviter_id: int) -> str:
@@ -429,6 +631,204 @@ def is_user_in_game(user_id: int) -> bool:
     return False
 
 
+# РЕФЕРАЛЬНАЯ СИСТЕМА - ФУНКЦИИ
+def get_referral_data(referrer_id: int, referred_id: int):
+    """Получает данные о реферале"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute('''
+        SELECT * FROM referrals 
+        WHERE referrer_id = ? AND referred_id = ?
+    ''', (referrer_id, referred_id))
+
+    result = cursor.fetchone()
+    conn.close()
+
+    if result:
+        return {
+            'referrer_id': result[0],
+            'referred_id': result[1],
+            'games_played': result[2],
+            'is_completed': bool(result[3]),
+            'created_at': result[4]
+        }
+    return None
+
+
+def create_referral(referrer_id: int, referred_id: int):
+    """Создает запись о реферале"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute('''
+        INSERT OR REPLACE INTO referrals 
+        (referrer_id, referred_id, games_played, is_completed, created_at)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (referrer_id, referred_id, 0, False, datetime.now().isoformat()))
+
+    conn.commit()
+    conn.close()
+
+
+def update_referral_games(referrer_id: int, referred_id: int):
+    """Обновляет количество сыгранных игр рефералом"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute('''
+        UPDATE referrals 
+        SET games_played = games_played + 1 
+        WHERE referrer_id = ? AND referred_id = ?
+    ''', (referrer_id, referred_id))
+
+    conn.commit()
+    conn.close()
+
+
+def complete_referral(referrer_id: int, referred_id: int):
+    """Отмечает реферала как завершенного"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute('''
+        UPDATE referrals 
+        SET is_completed = TRUE 
+        WHERE referrer_id = ? AND referred_id = ?
+    ''', (referrer_id, referred_id))
+
+    conn.commit()
+    conn.close()
+
+
+def get_completed_referrals_count(referrer_id: int) -> int:
+    """Получает количество завершенных рефералов"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute('''
+        SELECT COUNT(*) FROM referrals 
+        WHERE referrer_id = ? AND is_completed = TRUE
+    ''', (referrer_id,))
+
+    count = cursor.fetchone()[0]
+    conn.close()
+    return count
+
+
+def get_pending_referrals_count(referrer_id: int) -> int:
+    """Получает количество незавершенных рефералов"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute('''
+        SELECT COUNT(*) FROM referrals 
+        WHERE referrer_id = ? AND is_completed = FALSE
+    ''', (referrer_id,))
+
+    count = cursor.fetchone()[0]
+    conn.close()
+    return count
+
+
+def add_inventory_item(user_id: int, item_type: str, item_name: str):
+    """Добавляет предмет в инвентарь"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute('''
+        INSERT OR REPLACE INTO inventory 
+        (user_id, item_type, item_name, quantity, obtained_at)
+        VALUES (?, ?, ?, COALESCE((SELECT quantity FROM inventory WHERE user_id = ? AND item_type = ? AND item_name = ?), 0) + 1, ?)
+    ''', (user_id, item_type, item_name, user_id, item_type, item_name, datetime.now().isoformat()))
+
+    conn.commit()
+    conn.close()
+
+
+def get_inventory(user_id: int):
+    """Получает инвентарь пользователя"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute('''
+        SELECT item_type, item_name, quantity FROM inventory 
+        WHERE user_id = ? ORDER BY item_type, item_name
+    ''', (user_id,))
+
+    items = cursor.fetchall()
+    conn.close()
+    return items
+
+
+def add_user_status(user_id: int, status_name: str):
+    """Добавляет статус пользователю"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute('''
+        INSERT OR REPLACE INTO user_statuses 
+        (user_id, status_name, is_active, obtained_at)
+        VALUES (?, ?, ?, ?)
+    ''', (user_id, status_name, False, datetime.now().isoformat()))
+
+    conn.commit()
+    conn.close()
+
+
+def get_user_statuses(user_id: int):
+    """Получает все статусы пользователя"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute('''
+        SELECT status_name, is_active FROM user_statuses 
+        WHERE user_id = ? ORDER BY obtained_at
+    ''', (user_id,))
+
+    statuses = cursor.fetchall()
+    conn.close()
+    return statuses
+
+
+def set_active_status(user_id: int, status_name: str):
+    """Устанавливает активный статус"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # Сначала сбрасываем все статусы
+    cursor.execute('''
+        UPDATE user_statuses 
+        SET is_active = FALSE 
+        WHERE user_id = ?
+    ''', (user_id,))
+
+    # Устанавливаем выбранный статус как активный
+    cursor.execute('''
+        UPDATE user_statuses 
+        SET is_active = TRUE 
+        WHERE user_id = ? AND status_name = ?
+    ''', (user_id, status_name))
+
+    conn.commit()
+    conn.close()
+
+
+def get_active_status(user_id: int):
+    """Получает активный статус пользователя"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute('''
+        SELECT status_name FROM user_statuses 
+        WHERE user_id = ? AND is_active = TRUE
+    ''', (user_id,))
+
+    result = cursor.fetchone()
+    conn.close()
+    return result[0] if result else DEFAULT_STATUS
+
+
 # Глобальные переменные для матчмейкинга
 matchmaking_queue = []
 game_sessions = {}
@@ -440,13 +840,18 @@ async def cmd_start(message: Message):
     user_id = message.from_user.id
     username = message.from_user.username or message.from_user.first_name
 
+    # Проверяем блокировку
+    user_data = get_user_data(user_id)
+    if user_data and user_data.get('is_blocked'):
+        await message.answer("❌ Вы заблокированы и не можете использовать бота.")
+        return
+
     # Сохраняем информацию о чате
     if message.chat.type == 'private':
         save_chat_info(user_id, 'private', username)
     else:
         save_chat_info(message.chat.id, message.chat.type, message.chat.title, getattr(message.chat, 'member_count', 0))
 
-    user_data = get_user_data(user_id)
     if not user_data:
         user_data = {
             'user_id': user_id,
@@ -456,7 +861,9 @@ async def cmd_start(message: Message):
             'wins': 0,
             'losses': 0,
             'draws': 0,
-            'registered_at': datetime.now().isoformat()
+            'registered_at': datetime.now().isoformat(),
+            'last_game_at': None,
+            'is_blocked': False
         }
         save_user_data(user_data)
 
@@ -490,9 +897,21 @@ async def cmd_start(message: Message):
                 # Создаем игру между пригласившим и принявшим приглашение
                 await start_game(inviter_id, user_id, is_rated=False)
                 return
-            else:
-                await message.answer("❌ Неверная или устаревшая ссылка приглашения!")
+        elif args[1].startswith('ref_'):
+            # Обработка реферальной ссылки
+            referrer_id = int(args[1].replace('ref_', ''))
+
+            if referrer_id == user_id:
+                await message.answer("❌ Нельзя использовать собственную реферальную ссылку!")
                 return
+
+            # Создаем запись о реферале
+            create_referral(referrer_id, user_id)
+            await message.answer(
+                "🎉 Вы присоединились по реферальной ссылке! "
+                f"Теперь вам нужно сыграть {REF_REQUIRED_GAMES} игры и достичь звания '{REF_REQUIRED_RANK}' "
+                "чтобы реферал засчитался."
+            )
 
     # Проверяем, не находится ли пользователь уже в игре
     if is_user_in_game(user_id):
@@ -503,7 +922,8 @@ async def cmd_start(message: Message):
         [InlineKeyboardButton(text="🎮 Найти игру", callback_data="find_game")],
         [InlineKeyboardButton(text="👤 Профиль", callback_data="profile"),
          InlineKeyboardButton(text="🏆 Топ-10", callback_data="top_10")],
-        [InlineKeyboardButton(text="👥 Играть с другом", callback_data="play_friend")]
+        [InlineKeyboardButton(text="👥 Играть с другом", callback_data="play_friend")],
+        [InlineKeyboardButton(text="🎁 Реферальная программа", callback_data="ref_program")]
     ])
 
     await message.answer(
@@ -513,9 +933,348 @@ async def cmd_start(message: Message):
     )
 
 
+@router.message(Command("ref"))
+async def cmd_ref(message: Message):
+    """Реферальная программа"""
+    user_id = message.from_user.id
+    bot_username = (await bot.get_me()).username
+
+    completed_refs = get_completed_referrals_count(user_id)
+    pending_refs = get_pending_referrals_count(user_id)
+
+    ref_link = f"https://t.me/{bot_username}?start=ref_{user_id}"
+
+    ref_text = (
+        "🎁 Реферальная программа\n\n"
+        "💼 Механика:\n"
+        "• Дайте другу вашу реферальную ссылку\n"
+        "• Друг должен сыграть 3 любые игры (с другом или ботом)\n"
+        "• Друг должен достичь звания 'Любитель' (100+ рейтинга)\n"
+        "• После этого реферал засчитывается\n\n"
+        f"✅ Завершенных рефералов: {completed_refs}\n"
+        f"⏳ Ожидающих завершения: {pending_refs}\n"
+        f"🎰 Доступно прокруток рулетки: {completed_refs // REF_FOR_ROULETTE}\n\n"
+        f"🔗 Ваша реферальная ссылка:\n{ref_link}\n\n"
+        f"За каждые {REF_FOR_ROULETTE} рефералов вы получаете прокрутку рулетки!"
+    )
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎰 Крутить рулетку", callback_data="roulette")],
+        [InlineKeyboardButton(text="🔗 Скопировать ссылку", callback_data=f"copy_ref_{user_id}")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]
+    ])
+
+    await message.answer(ref_text, reply_markup=keyboard)
+
+
+@router.callback_query(F.data == "ref_program")
+async def ref_program_handler(callback: CallbackQuery):
+    """Обработчик кнопки реферальной программы"""
+    await cmd_ref(callback.message)
+
+
+@router.callback_query(F.data.startswith("copy_ref_"))
+async def copy_ref_link(callback: CallbackQuery):
+    """Копирование реферальной ссылки"""
+    user_id = int(callback.data.replace("copy_ref_", ""))
+    bot_username = (await bot.get_me()).username
+    ref_link = f"https://t.me/{bot_username}?start=ref_{user_id}"
+
+    await callback.answer(f"Реферальная ссылка скопирована: {ref_link}", show_alert=True)
+
+
+@router.callback_query(F.data == "roulette")
+async def roulette_handler(callback: CallbackQuery):
+    """Обработчик рулетки"""
+    user_id = callback.from_user.id
+
+    if callback.message.chat.type != 'private':
+        await callback.answer("❌ Рулетка доступна только в личных сообщениях с ботом!", show_alert=True)
+        return
+
+    completed_refs = get_completed_referrals_count(user_id)
+    available_spins = completed_refs // REF_FOR_ROULETTE
+
+    if available_spins <= 0:
+        await callback.answer(
+            f"❌ У вас нет доступных прокруток! Нужно {REF_FOR_ROULETTE} рефералов для одной прокрутки.",
+            show_alert=True
+        )
+        return
+
+    # Показываем информацию о рулетке
+    roulette_info = (
+        "🎰 Рулетка призов\n\n"
+        "🎲 Шансы выпадения:\n"
+        "• NFT подарок - 0.1%\n"
+        "• Обычный подарок - 10%\n"
+        "• Мишка - 5%\n"
+        "• Сердечко - 5%\n"
+        "• Ничего - 30%\n"
+        "• Статус - 49.9%\n\n"
+        f"🔄 Доступно прокруток: {available_spins}"
+    )
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎰 Крутить рулетку!", callback_data="spin_roulette")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="ref_program")]
+    ])
+
+    await callback.message.edit_text(roulette_info, reply_markup=keyboard)
+
+
+@router.callback_query(F.data == "spin_roulette")
+async def spin_roulette_handler(callback: CallbackQuery):
+    """Прокрутка рулетки"""
+    user_id = callback.from_user.id
+
+    completed_refs = get_completed_referrals_count(user_id)
+    available_spins = completed_refs // REF_FOR_ROULETTE
+
+    if available_spins <= 0:
+        await callback.answer("❌ Нет доступных прокруток!", show_alert=True)
+        return
+
+    # Спин рулетки
+    spin_result = spin_roulette()
+
+    # Добавляем приз в инвентарь
+    if spin_result['type'] != 'nothing':
+        add_inventory_item(user_id, spin_result['type'], spin_result['name'])
+
+    # Обновляем количество прокруток
+    completed_refs -= REF_FOR_ROULETTE
+    # Здесь должна быть логика обновления счетчика прокруток в БД
+
+    result_text = (
+        f"🎰 Результат прокрутки:\n\n"
+        f"🏆 Вы выиграли: {spin_result['name']}!\n"
+        f"📦 Тип: {spin_result['type']}\n\n"
+    )
+
+    if spin_result['type'] == 'status':
+        result_text += "✨ Новый статус добавлен в вашу коллекцию! Используйте /mystatus чтобы посмотреть."
+    elif spin_result['type'] != 'nothing':
+        result_text += "🎁 Предмет добавлен в инвентарь!"
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎰 Крутить еще раз", callback_data="spin_roulette")],
+        [InlineKeyboardButton(text="📦 Мой инвентарь", callback_data="my_inventory")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="ref_program")]
+    ])
+
+    await callback.message.edit_text(result_text, reply_markup=keyboard)
+
+
+def spin_roulette():
+    """Логика прокрутки рулетки"""
+    rand = random.random() * 100
+
+    if rand < 0.1:  # 0.1%
+        return {'type': 'nft', 'name': 'NFT подарок'}
+    elif rand < 10.1:  # 10%
+        return {'type': 'gift', 'name': 'Обычный подарок'}
+    elif rand < 15.1:  # 5%
+        return {'type': 'gift', 'name': 'Мишка'}
+    elif rand < 20.1:  # 5%
+        return {'type': 'gift', 'name': 'Сердечко'}
+    elif rand < 50.1:  # 30%
+        return {'type': 'nothing', 'name': 'Ничего'}
+    else:  # 49.9%
+        status = random.choice(STATUSES)
+        return {'type': 'status', 'name': status}
+
+
+@router.message(Command("status"))
+async def cmd_status(message: Message):
+    """Показывает все возможные статусы"""
+    status_text = "📋 Все возможные статусы:\n\n"
+
+    for i, status in enumerate(STATUSES, 1):
+        status_text += f"{i}. {status}\n"
+
+    status_text += f"\nИспользуйте /mystatus чтобы посмотреть ваши статусы"
+
+    await message.answer(status_text)
+
+
+@router.message(Command("mystatus"))
+async def cmd_mystatus(message: Message):
+    """Показывает статусы пользователя"""
+    user_id = message.from_user.id
+    user_statuses = get_user_statuses(user_id)
+    active_status = get_active_status(user_id)
+
+    if not user_statuses:
+        status_text = f"📊 Ваши статусы:\n\n• {DEFAULT_STATUS}\n\nУ вас пока нет статусов. Получите их через рулетку!"
+    else:
+        status_text = f"📊 Ваши статусы:\n\n"
+        status_text += f"🎯 Активный статус: {active_status}\n\n"
+        status_text += "📜 Ваша коллекция:\n"
+
+        for i, (status_name, is_active) in enumerate(user_statuses, 1):
+            emoji = "⭐" if is_active else "◯"
+            status_text += f"{i}. {emoji} {status_name}\n"
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Сменить статус", callback_data="change_status")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]
+    ])
+
+    await message.answer(status_text, reply_markup=keyboard)
+
+
+@router.callback_query(F.data == "change_status")
+async def change_status_handler(callback: CallbackQuery):
+    """Смена статуса"""
+    user_id = callback.from_user.id
+    user_statuses = get_user_statuses(user_id)
+
+    if not user_statuses:
+        await callback.answer("❌ У вас нет статусов для выбора!", show_alert=True)
+        return
+
+    # Создаем клавиатуру с номерами статусов
+    keyboard_buttons = []
+    row = []
+    for i, (status_name, is_active) in enumerate(user_statuses, 1):
+        row.append(InlineKeyboardButton(text=str(i), callback_data=f"set_status_{i}"))
+        if i % 5 == 0:  # 5 кнопок в ряду
+            keyboard_buttons.append(row)
+            row = []
+    if row:
+        keyboard_buttons.append(row)
+
+    keyboard_buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="mystatus_back")])
+
+    status_list = "\n".join([f"{i}. {status_name}" for i, (status_name, _) in enumerate(user_statuses, 1)])
+
+    await callback.message.edit_text(
+        f"🔄 Выберите статус (введите номер):\n\n{status_list}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+    )
+
+
+@router.callback_query(F.data.startswith("set_status_"))
+async def set_status_handler(callback: CallbackQuery):
+    """Установка статуса по номеру"""
+    user_id = callback.from_user.id
+    status_num = int(callback.data.replace("set_status_", "")) - 1
+
+    user_statuses = get_user_statuses(user_id)
+
+    if 0 <= status_num < len(user_statuses):
+        status_name = user_statuses[status_num][0]
+        set_active_status(user_id, status_name)
+
+        await callback.answer(f"✅ Статус изменен на: {status_name}", show_alert=True)
+        await cmd_mystatus(callback.message)
+    else:
+        await callback.answer("❌ Неверный номер статуса!", show_alert=True)
+
+
+@router.callback_query(F.data == "mystatus_back")
+async def mystatus_back_handler(callback: CallbackQuery):
+    """Назад к просмотру статусов"""
+    await cmd_mystatus(callback.message)
+
+
+@router.message(Command("stats"))
+async def cmd_stats(message: Message):
+    """Установка статуса по номеру"""
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("❌ Использование: /stats <номер_статуса>")
+        return
+
+    try:
+        status_num = int(args[1]) - 1
+        user_id = message.from_user.id
+        user_statuses = get_user_statuses(user_id)
+
+        if not user_statuses:
+            await message.answer("❌ У вас нет статусов!")
+            return
+
+        if 0 <= status_num < len(user_statuses):
+            status_name = user_statuses[status_num][0]
+            set_active_status(user_id, status_name)
+            await message.answer(f"✅ Статус изменен на: {status_name}")
+        else:
+            await message.answer("❌ Неверный номер статуса!")
+
+    except ValueError:
+        await message.answer("❌ Номер статуса должен быть числом!")
+
+
+@router.message(Command("report"))
+async def cmd_report(message: Message):
+    """Отчет о получении подарка"""
+    user_id = message.from_user.id
+    user_data = get_user_data(user_id)
+
+    if not user_data:
+        await message.answer("❌ Сначала зарегистрируйтесь через /start")
+        return
+
+    # Отправляем уведомление админу
+    report_text = (
+        f"🚨 ПОЛУЧЕН ПОДАРОК\n\n"
+        f"👤 Пользователь: {user_data['username']} (ID: {user_id})\n"
+        f"🕐 Время: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"🎮 Игр сыграно: {user_data['games_played']}\n"
+        f"⭐ Рейтинг: {user_data['rating']}"
+    )
+
+    try:
+        await bot.send_message(ADMIN_ID, report_text)
+        await message.answer("✅ Ваш отчет отправлен администратору!")
+    except Exception as e:
+        await message.answer("❌ Ошибка отправки отчета. Попробуйте позже.")
+        print(f"Ошибка отправки отчета: {e}")
+
+
+@router.callback_query(F.data == "my_inventory")
+async def my_inventory_handler(callback: CallbackQuery):
+    """Показывает инвентарь пользователя"""
+    user_id = callback.from_user.id
+    inventory = get_inventory(user_id)
+
+    if not inventory:
+        inventory_text = "🎒 Ваш инвентарь пуст.\n\nПолучите предметы через рулетку!"
+    else:
+        inventory_text = "🎒 Ваш инвентарь:\n\n"
+
+        # Группируем предметы по типам
+        items_by_type = {}
+        for item_type, item_name, quantity in inventory:
+            if item_type not in items_by_type:
+                items_by_type[item_type] = []
+            items_by_type[item_type].append((item_name, quantity))
+
+        for item_type, items in items_by_type.items():
+            inventory_text += f"📦 {item_type.upper()}:\n"
+            for item_name, quantity in items:
+                inventory_text += f"  • {item_name} ×{quantity}\n"
+            inventory_text += "\n"
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎰 Крутить рулетку", callback_data="roulette")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="ref_program")]
+    ])
+
+    await callback.message.edit_text(inventory_text, reply_markup=keyboard)
+
+
 @router.callback_query(F.data == "create_invite")
 async def create_invite_handler(callback: CallbackQuery):
     user_id = callback.from_user.id
+
+    # Проверяем блокировку
+    user_data = get_user_data(user_id)
+    if user_data and user_data.get('is_blocked'):
+        await callback.answer("❌ Вы заблокированы и не можете использовать бота.", show_alert=True)
+        return
 
     # Проверяем, не находится ли пользователь уже в игре
     if is_user_in_game(user_id):
@@ -556,6 +1315,12 @@ async def copy_invite_link(callback: CallbackQuery):
 @router.callback_query(F.data == "find_game")
 async def find_game_handler(callback: CallbackQuery):
     user_id = callback.from_user.id
+
+    # Проверяем блокировку
+    user_data = get_user_data(user_id)
+    if user_data and user_data.get('is_blocked'):
+        await callback.answer("❌ Вы заблокированы и не можете использовать бота.", show_alert=True)
+        return
 
     # Проверяем, не находится ли пользователь уже в игре
     if is_user_in_game(user_id):
@@ -620,12 +1385,14 @@ async def show_profile(callback: CallbackQuery):
 
     rank = get_user_rank(user_data['rating'])
     position = get_user_position(user_id)
+    active_status = get_active_status(user_id)
 
     win_rate = (user_data['wins'] / user_data['games_played'] * 100) if user_data['games_played'] > 0 else 0
 
     profile_text = (
         f"👤 Профиль игрока\n\n"
         f"📛 Имя: {user_data['username']}\n"
+        f"🎯 Статус: {active_status}\n"
         f"🏅 Звание: {rank['name']}\n"
         f"⭐ Рейтинг: {user_data['rating']}\n"
         f"📊 Позиция в рейтинге: #{position}\n\n"
@@ -665,8 +1432,15 @@ async def show_top_10(callback: CallbackQuery):
 
 @router.callback_query(F.data == "play_friend")
 async def play_with_friend(callback: CallbackQuery):
-    # Проверяем, не находится ли пользователь уже в игре
     user_id = callback.from_user.id
+
+    # Проверяем блокировку
+    user_data = get_user_data(user_id)
+    if user_data and user_data.get('is_blocked'):
+        await callback.answer("❌ Вы заблокированы и не можете использовать бота.", show_alert=True)
+        return
+
+    # Проверяем, не находится ли пользователь уже в игре
     if is_user_in_game(user_id):
         await callback.answer(
             "❌ Вы уже находитесь в активной игре! Завершите текущую игру перед созданием приглашения.", show_alert=True)
@@ -690,7 +1464,8 @@ async def back_to_main(callback: CallbackQuery):
         [InlineKeyboardButton(text="🎮 Найти игру", callback_data="find_game")],
         [InlineKeyboardButton(text="👤 Профиль", callback_data="profile"),
          InlineKeyboardButton(text="🏆 Топ-10", callback_data="top_10")],
-        [InlineKeyboardButton(text="👥 Играть с другом", callback_data="play_friend")]
+        [InlineKeyboardButton(text="👥 Играть с другом", callback_data="play_friend")],
+        [InlineKeyboardButton(text="🎁 Реферальная программа", callback_data="ref_program")]
     ])
 
     await callback.message.edit_text(
@@ -880,6 +1655,39 @@ async def finish_game(game: TicTacToeGame, game_id: str):
     winner_text = ""
     rating_changes = {}
 
+    # Обновляем реферальную статистику для всех игроков
+    for player_id in [game.player1, game.player2]:
+        if player_id != -1:  # Не бот
+            # Ищем реферальные связи где этот игрок является рефералом
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute('SELECT referrer_id FROM referrals WHERE referred_id = ? AND is_completed = FALSE',
+                           (player_id,))
+            referrals = cursor.fetchall()
+            conn.close()
+
+            for (referrer_id,) in referrals:
+                update_referral_games(referrer_id, player_id)
+
+                # Проверяем условия завершения реферала
+                referral_data = get_referral_data(referrer_id, player_id)
+                user_data = get_user_data(player_id)
+
+                if (referral_data and user_data and
+                        referral_data['games_played'] >= REF_REQUIRED_GAMES and
+                        user_data['rating'] >= 100):  # Звание Любитель
+                    complete_referral(referrer_id, player_id)
+
+                    # Уведомляем реферера
+                    try:
+                        await bot.send_message(
+                            referrer_id,
+                            f"🎉 Ваш реферал @{user_data['username']} выполнил все условия!\n"
+                            f"Теперь у вас +1 завершенный реферал!"
+                        )
+                    except:
+                        pass
+
     if game.winner == 'draw':
         winner_text = "🤝 Ничья!"
         # Обновляем статистику
@@ -890,6 +1698,7 @@ async def finish_game(game: TicTacToeGame, game_id: str):
                     user_data['games_played'] += 1
                     user_data['draws'] += 1
                     save_user_data(user_data)
+                    update_last_game_time(player_id)
     else:
         winner_id = game.winner
         loser_id = game.player1 if winner_id == game.player2 else game.player2
@@ -942,7 +1751,8 @@ async def finish_game(game: TicTacToeGame, game_id: str):
                 else:
                     winner_name = winner_data['username']
                     rating_change = rating_changes.get(winner_id)
-                    winner_text = f"🎉 Победитель: {winner_name}"
+                    rating_text = f" (+{rating_change}⭐)" if rating_change else ""
+                    winner_text = f"🎉 Победитель: {winner_name}{rating_text}"
             else:
                 winner_text = "🎉 Игра завершена!"
         else:
@@ -957,6 +1767,12 @@ async def finish_game(game: TicTacToeGame, game_id: str):
                 user_data['losses'] += 1
                 save_user_data(user_data)
                 rating_changes[game.player1] = -lose_change
+
+        # Обновляем время последней игры
+        if winner_id != -1:
+            update_last_game_time(winner_id)
+        if loser_id != -1:
+            update_last_game_time(loser_id)
 
     # Отправляем результаты
     for player_id in [game.player1, game.player2]:
@@ -1049,14 +1865,512 @@ async def start_game_with_bot(player_id: int, is_rated: bool = True, chat_id: in
     game.save_to_db(game_id)
 
 
-# КОМАНДА SMS ДЛЯ АДМИНА и остальные обработчики остаются без изменений...
+# КОМАНДА /SMS ДЛЯ АДМИНА
+@router.message(Command("sms"))
+async def cmd_sms(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("❌ У вас нет прав для использования этой команды.")
+        return
+
+    if message.chat.type != 'private':
+        await message.answer("❌ Эта команда доступна только в личных сообщениях с ботом.")
+        return
+
+    await message.answer(
+        "📢 Режим рассылки сообщений\n\n"
+        "Отправьте текст сообщения или нажмите 'Пропустить':",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⏭ Пропустить текст", callback_data="skip_text")]
+        ])
+    )
+    await state.set_state(SMSStates.waiting_text)
+
+
+@router.callback_query(F.data == "skip_text")
+async def skip_text(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(text=None)
+    await callback.message.edit_text(
+        "📷 Хотите добавить фото? Отправьте фото или нажмите 'Пропустить':",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⏭ Пропустить фото", callback_data="skip_photo")]
+        ])
+    )
+    await state.set_state(SMSStates.waiting_photo)
+
+
+@router.message(SMSStates.waiting_text)
+async def process_sms_text(message: Message, state: FSMContext):
+    await state.update_data(text=message.text)
+    await message.answer(
+        "📷 Хотите добавить фото? Отправьте фото или нажмите 'Пропустить':",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⏭ Пропустить фото", callback_data="skip_photo")]
+        ])
+    )
+    await state.set_state(SMSStates.waiting_photo)
+
+
+@router.callback_query(F.data == "skip_photo")
+async def skip_photo(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(photo=None)
+    await callback.message.edit_text(
+        "🎥 Хотите добавить видео? Отправьте видео или нажмите 'Пропустить':",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⏭ Пропустить видео", callback_data="skip_video")]
+        ])
+    )
+    await state.set_state(SMSStates.waiting_video)
+
+
+@router.message(SMSStates.waiting_photo)
+async def process_sms_photo(message: Message, state: FSMContext):
+    if message.photo:
+        await state.update_data(photo=message.photo[-1].file_id)
+    else:
+        await state.update_data(photo=None)
+
+    await message.answer(
+        "🎥 Хотите добавить видео? Отправьте видео или нажмите 'Пропустить':",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⏭ Пропустить видео", callback_data="skip_video")]
+        ])
+    )
+    await state.set_state(SMSStates.waiting_video)
+
+
+@router.callback_query(F.data == "skip_video")
+async def skip_video(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(video=None)
+    await callback.message.edit_text(
+        "🔄 Хотите добавить GIF? Отправьте GIF или нажмите 'Пропустить':",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⏭ Пропустить GIF", callback_data="skip_gif")]
+        ])
+    )
+    await state.set_state(SMSStates.waiting_gif)
+
+
+@router.message(SMSStates.waiting_video)
+async def process_sms_video(message: Message, state: FSMContext):
+    if message.video:
+        await state.update_data(video=message.video.file_id)
+    else:
+        await state.update_data(video=None)
+
+    await message.answer(
+        "🔄 Хотите добавить GIF? Отправьте GIF или нажмите 'Пропустить':",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⏭ Пропустить GIF", callback_data="skip_gif")]
+        ])
+    )
+    await state.set_state(SMSStates.waiting_gif)
+
+
+@router.callback_query(F.data == "skip_gif")
+async def skip_gif(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(gif=None)
+    await callback.message.edit_text(
+        "🔘 Хотите добавить кнопки? Отправьте текст кнопок в формате:\n"
+        "Текст кнопки1 - ссылка1\n"
+        "Текст кнопки2 - ссылка2\n\n"
+        "Или нажмите 'Пропустить':",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⏭ Пропустить кнопки", callback_data="skip_buttons")]
+        ])
+    )
+    await state.set_state(SMSStates.waiting_buttons)
+
+
+@router.message(SMSStates.waiting_gif)
+async def process_sms_gif(message: Message, state: FSMContext):
+    if message.animation:
+        await state.update_data(gif=message.animation.file_id)
+    else:
+        await state.update_data(gif=None)
+
+    await message.answer(
+        "🔘 Хотите добавить кнопки? Отправьте текст кнопок в формате:\n"
+        "Текст кнопки1 - ссылка1\n"
+        "Текст кнопки2 - ссылка2\n\n"
+        "Или нажмите 'Пропустить':",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⏭ Пропустить кнопки", callback_data="skip_buttons")]
+        ])
+    )
+    await state.set_state(SMSStates.waiting_buttons)
+
+
+@router.callback_query(F.data == "skip_buttons")
+async def skip_buttons(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(buttons=None)
+    await send_broadcast_message(callback, state)
+
+
+@router.message(SMSStates.waiting_buttons)
+async def process_sms_buttons(message: Message, state: FSMContext):
+    buttons_data = None
+    if message.text and message.text != "⏭ Пропустить кнопки":
+        buttons_data = message.text
+
+    await state.update_data(buttons=buttons_data)
+    await send_broadcast_message(message, state)
+
+
+async def send_broadcast_message(update, state: FSMContext):
+    data = await state.get_data()
+
+    # Создаем клавиатуру из кнопок
+    keyboard = None
+    if data.get('buttons'):
+        try:
+            buttons = []
+            for line in data['buttons'].split('\n'):
+                if ' - ' in line:
+                    text, url = line.split(' - ', 1)
+                    buttons.append([InlineKeyboardButton(text=text.strip(), url=url.strip())])
+            if buttons:
+                keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+        except Exception as e:
+            print(f"Ошибка создания кнопок: {e}")
+
+    # Получаем всех пользователей (только ЛС, не чаты)
+    users = get_all_users()
+    success_count = 0
+    fail_count = 0
+
+    if isinstance(update, CallbackQuery):
+        await update.answer("🔄 Начинаю рассылку сообщений...")
+    else:
+        await update.answer("🔄 Начинаю рассылку сообщений...")
+
+    for user_id in users:
+        try:
+            if data.get('photo'):
+                await bot.send_photo(
+                    chat_id=user_id,
+                    photo=data['photo'],
+                    caption=data.get('text', ''),
+                    reply_markup=keyboard
+                )
+            elif data.get('video'):
+                await bot.send_video(
+                    chat_id=user_id,
+                    video=data['video'],
+                    caption=data.get('text', ''),
+                    reply_markup=keyboard
+                )
+            elif data.get('gif'):
+                await bot.send_animation(
+                    chat_id=user_id,
+                    animation=data['gif'],
+                    caption=data.get('text', ''),
+                    reply_markup=keyboard
+                )
+            else:
+                await bot.send_message(
+                    chat_id=user_id,
+                    text=data.get('text', '📢 Сообщение от администратора'),
+                    reply_markup=keyboard
+                )
+            success_count += 1
+        except Exception as e:
+            print(f"Ошибка отправки пользователю {user_id}: {e}")
+            fail_count += 1
+        await asyncio.sleep(0.1)  # Задержка чтобы не превысить лимиты
+
+    # Сохраняем статистику рассылки
+    save_broadcast_stats(success_count, fail_count)
+
+    # Отправляем отчет админу
+    report_message = (
+        f"✅ Рассылка завершена!\n\n"
+        f"✅ Успешно: {success_count}\n"
+        f"❌ Ошибок: {fail_count}"
+    )
+
+    if isinstance(update, CallbackQuery):
+        await update.message.answer(report_message)
+    else:
+        await update.answer(report_message)
+
+    await state.clear()
+
+
+# АДМИН ПАНЕЛЬ
+@router.message(Command("apanel"))
+async def cmd_apanel(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("❌ У вас нет прав для использования этой команды.")
+        return
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
+        [InlineKeyboardButton(text="🚫 Заблокировать пользователя", callback_data="admin_block")],
+        [InlineKeyboardButton(text="✅ Разблокировать пользователя", callback_data="admin_unblock")],
+        [InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_broadcast")]
+    ])
+
+    await message.answer(
+        "👨‍💻 Админ панель\n\n"
+        "Выберите действие:",
+        reply_markup=keyboard
+    )
+
+
+@router.callback_query(F.data == "admin_stats")
+async def admin_stats(callback: CallbackQuery, state: FSMContext):
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="1 день", callback_data="stats_24")],
+        [InlineKeyboardButton(text="1 неделя", callback_data="stats_168")],
+        [InlineKeyboardButton(text="1 месяц", callback_data="stats_720")]
+    ])
+
+    await callback.message.edit_text(
+        "📊 Выберите период для статистики:",
+        reply_markup=keyboard
+    )
+
+
+@router.callback_query(F.data.startswith("stats_"))
+async def show_stats(callback: CallbackQuery):
+    period = callback.data.replace("stats_", "")
+    period_hours = int(period)
+
+    stats = get_stats(period_hours)
+
+    period_text = ""
+    if period_hours == 24:
+        period_text = "за последние 24 часа"
+    elif period_hours == 168:
+        period_text = "за последнюю неделю"
+    else:
+        period_text = "за последний месяц"
+
+    stats_text = (
+        f"📊 Статистика {period_text}:\n\n"
+        f"👤 Новые пользователи: {stats['new_users']}\n"
+        f"🎮 Сыграно игр: {stats['games_played']}\n"
+        f"😴 Неактивных пользователей: {stats['inactive_users']}\n"
+        f"💬 Новых чатов: {stats['new_chats']}"
+    )
+
+    await callback.message.edit_text(
+        stats_text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_apanel")]
+        ])
+    )
+
+
+@router.callback_query(F.data == "admin_block")
+async def admin_block(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text(
+        "🚫 Введите username пользователя для блокировки (без @):"
+    )
+    await state.set_state(AdminStates.waiting_username_for_block)
+
+
+@router.message(AdminStates.waiting_username_for_block)
+async def process_block_user(message: Message, state: FSMContext):
+    username = message.text.strip()
+
+    if block_user(username):
+        await message.answer(f"✅ Пользователь @{username} заблокирован!")
+    else:
+        await message.answer(f"❌ Пользователь @{username} не найден!")
+
+    await state.clear()
+
+
+@router.callback_query(F.data == "admin_unblock")
+async def admin_unblock(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text(
+        "✅ Введите username пользователя для разблокировки (без @):"
+    )
+    await state.set_state(AdminStates.waiting_username_for_unblock)
+
+
+@router.message(AdminStates.waiting_username_for_unblock)
+async def process_unblock_user(message: Message, state: FSMContext):
+    username = message.text.strip()
+
+    if unblock_user(username):
+        await message.answer(f"✅ Пользователь @{username} разблокирован!")
+    else:
+        await message.answer(f"❌ Пользователь @{username} не найден или не был заблокирован!")
+
+    await state.clear()
+
+
+@router.callback_query(F.data == "admin_broadcast")
+async def admin_broadcast(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "📢 Для начала рассылки используйте команду /sms"
+    )
+
+
+@router.callback_query(F.data == "back_to_apanel")
+async def back_to_apanel(callback: CallbackQuery):
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
+        [InlineKeyboardButton(text="🚫 Заблокировать пользователя", callback_data="admin_block")],
+        [InlineKeyboardButton(text="✅ Разблокировать пользователя", callback_data="admin_unblock")],
+        [InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_broadcast")]
+    ])
+
+    await callback.message.edit_text(
+        "👨‍💻 Админ панель\n\n"
+        "Выберите действие:",
+        reply_markup=keyboard
+    )
+
+
+# ФУНКЦИЯ РАССЫЛКИ НЕАКТИВНЫМ ПОЛЬЗОВАТЕЛЯМ
+async def send_inactive_users_reminder():
+    """Рассылает напоминания неактивным пользователям"""
+    inactive_users = get_inactive_users(24)  # Не играли более 24 часов
+
+    success_count = 0
+    fail_count = 0
+
+    for user_id, username, last_game in inactive_users:
+        try:
+            await bot.send_message(
+                user_id,
+                "👋 Эй, ты не забыл? Твой ранг все еще меньше Мастера, неужели ты не хочешь стать лучшим? 🏆"
+            )
+            success_count += 1
+        except Exception as e:
+            print(f"Ошибка отправки напоминания пользователю {user_id}: {e}")
+            fail_count += 1
+        await asyncio.sleep(0.1)
+
+    # Отправляем отчет админу
+    try:
+        await bot.send_message(
+            ADMIN_ID,
+            f"📢 Рассылка неактивным пользователям завершена!\n\n"
+            f"✅ Успешно: {success_count}\n"
+            f"❌ Ошибок: {fail_count}"
+        )
+    except:
+        pass
+
+
+# ОБРАБОТЧИК СДАЧИ В ИГРЕ
+@router.callback_query(F.data == "surrender")
+async def process_surrender(callback: CallbackQuery):
+    user_id = callback.from_user.id
+
+    # Находим игру
+    game = None
+    game_id = None
+    for gid, g in game_sessions.items():
+        if user_id in [g.player1, g.player2]:
+            game = g
+            game_id = gid
+            break
+
+    if not game:
+        await callback.answer("❌ Игра не найдена!")
+        return
+
+    # Определяем победителя и проигравшего
+    if user_id == game.player1:
+        winner_id = game.player2
+        loser_id = game.player1
+    else:
+        winner_id = game.player1
+        loser_id = game.player2
+
+    # Обновляем статистику
+    winner_data = get_user_data(winner_id)
+    loser_data = get_user_data(loser_id)
+
+    if game.is_rated and winner_data and loser_data:
+        # Отнимаем рейтинг за сдачу
+        lose_change = int(RATING_CHANGE_BASE * 0.8)  # 80% от стандартного штрафа
+        loser_data['rating'] -= lose_change
+        loser_data['games_played'] += 1
+        loser_data['losses'] += 1
+        save_user_data(loser_data)
+
+        # Обновляем время последней игры
+        update_last_game_time(winner_id)
+        update_last_game_time(loser_id)
+
+        # Отправляем сообщения игрокам
+        for player_id in [game.player1, game.player2]:
+            if player_id != -1:  # Не бот
+                user_data = get_user_data(player_id)
+                if user_data:
+                    if player_id == winner_id:
+                        message_text = (
+                            f"🎮 Игра завершена!\n\n"
+                            f"Противник сдался!\n\n"
+                            f"🏆 Вы победили!\n"
+                            f"Ваш рейтинг: {user_data['rating']}⭐"
+                        )
+                    else:
+                        message_text = (
+                            f"🎮 Игра завершена!\n\n"
+                            f"Вы сдались! 🏳️\n\n"
+                            f"📉 Изменение рейтинга: -{lose_change}⭐\n"
+                            f"Ваш рейтинг: {user_data['rating']}⭐"
+                        )
+
+                    await bot.send_message(
+                        player_id,
+                        message_text,
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="🎮 Новая игра", callback_data="find_game")],
+                            [InlineKeyboardButton(text="👤 Профиль", callback_data="profile")]
+                        ])
+                    )
+    else:
+        # Без рейтинга
+        if winner_data:
+            winner_data['games_played'] += 1
+            winner_data['wins'] += 1
+            save_user_data(winner_data)
+        if loser_data:
+            loser_data['games_played'] += 1
+            loser_data['losses'] += 1
+            save_user_data(loser_data)
+
+        # Обновляем время последней игры
+        update_last_game_time(winner_id)
+        update_last_game_time(loser_id)
+
+        # Отправляем сообщения
+        for player_id in [game.player1, game.player2]:
+            if player_id != -1:
+                if player_id == winner_id:
+                    await bot.send_message(player_id, "🎮 Противник сдался! Вы победили! 🏆")
+                else:
+                    await bot.send_message(player_id, "🎮 Вы сдались! 🏳️")
+
+    # Удаляем игру
+    if game_id in game_sessions:
+        del game_sessions[game_id]
+
+    await callback.answer("Вы сдались!")
+
 
 async def main():
     print("Бот запущен!")
+
+    # Запускаем периодическую рассылку неактивным пользователям (каждые 24 часа)
+    async def periodic_reminder():
+        while True:
+            await asyncio.sleep(24 * 60 * 60)  # 24 часа
+            await send_inactive_users_reminder()
+
+    # Запускаем периодическую задачу в фоне
+    asyncio.create_task(periodic_reminder())
+
     await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
