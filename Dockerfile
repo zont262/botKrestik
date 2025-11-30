@@ -1,4 +1,4 @@
-FROM python:3.10
+FROM python:3.9
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=on
@@ -12,3 +12,4 @@ RUN pip install --no-cache-dir --upgrade -r /app/requirements.txt
 COPY . /app
 
 CMD ["python", "main.py"]
+
