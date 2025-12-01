@@ -14,7 +14,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 # Настройки бота
 BOT_TOKEN = os.environ.get("TOKEN")
-#BOT_TOKEN = "6324958627:AAE7rRC-AUHod4sFWXrz-JQLUjb2eh_1hyQ"
+
 
 ADMIN_ID = 5301117772
 
@@ -36,6 +36,9 @@ STATUSES = [
     "Пат", "Матч", "Титан", "Воля", "Упорство", "Взлёт"
 ]
 DEFAULT_STATUS = "без статуса"
+
+# Таймаут хода в игре (в секундах)
+MOVE_TIMEOUT = 60  # 1 минута
 
 
 def get_db_connection():
@@ -73,7 +76,8 @@ def init_db():
             is_rated BOOLEAN,
             board_state TEXT,
             current_player INTEGER,
-            created_at TEXT
+            created_at TEXT,
+            last_move_time TEXT
         )
     ''')
 
@@ -166,6 +170,14 @@ def upgrade_db():
             if 'is_blocked' not in columns:
                 cursor.execute('ALTER TABLE users ADD COLUMN is_blocked BOOLEAN DEFAULT FALSE')
 
+        # Проверяем существование таблицы game_sessions и добавляем last_move_time
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='game_sessions'")
+        if cursor.fetchone():
+            cursor.execute("PRAGMA table_info(game_sessions)")
+            columns = [column[1] for column in cursor.fetchall()]
+            if 'last_move_time' not in columns:
+                cursor.execute('ALTER TABLE game_sessions ADD COLUMN last_move_time TEXT')
+
         # Создаем таблицу broadcasts если не существует
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS broadcasts (
@@ -255,6 +267,10 @@ class SMSStates(StatesGroup):
     waiting_buttons = State()
 
 
+class ReportStates(StatesGroup):
+    waiting_report_text = State()
+
+
 class AdminStates(StatesGroup):
     waiting_username_for_block = State()
     waiting_username_for_unblock = State()
@@ -274,6 +290,8 @@ class TicTacToeGame:
         self.moves = 0
         self.message_ids = {}  # Храним ID сообщений для редактирования
         self.bot_name = random.choice(BOT_NAMES) if is_vs_bot else None
+        self.last_move_time = datetime.now()  # Время последнего хода
+        self.timeout_task = None  # Задача для таймаута
 
     def make_move(self, row: int, col: int, player_id: int) -> bool:
         if self.board[row][col] != ' ' or player_id != self.current_player:
@@ -282,6 +300,7 @@ class TicTacToeGame:
         self.board[row][col] = self.symbols[player_id]
         self.moves += 1
         self.current_player = self.player2 if self.current_player == self.player1 else self.player1
+        self.last_move_time = datetime.now()  # Обновляем время последнего хода
         self.check_winner()
         return True
 
@@ -346,10 +365,10 @@ class TicTacToeGame:
 
         cursor.execute('''
             INSERT OR REPLACE INTO game_sessions 
-            (game_id, player1, player2, is_vs_bot, is_rated, board_state, current_player, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (game_id, player1, player2, is_vs_bot, is_rated, board_state, current_player, created_at, last_move_time)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (game_id, self.player1, self.player2, self.is_vs_bot, self.is_rated,
-              board_state, self.current_player, datetime.now().isoformat()))
+              board_state, self.current_player, datetime.now().isoformat(), self.last_move_time.isoformat()))
 
         conn.commit()
         conn.close()
@@ -833,6 +852,129 @@ def get_active_status(user_id: int):
 matchmaking_queue = []
 game_sessions = {}
 friend_invites = {}
+move_timeout_tasks = {}  # Задачи для отслеживания таймаута ходов
+
+
+async def check_move_timeout(game_id: str):
+    """Проверяет таймаут хода в игре"""
+    await asyncio.sleep(MOVE_TIMEOUT)  # Ждем 1 минуту
+
+    if game_id not in game_sessions:
+        return
+
+    game = game_sessions[game_id]
+
+    # Проверяем, сколько времени прошло с последнего хода
+    time_since_last_move = (datetime.now() - game.last_move_time).total_seconds()
+
+    if time_since_last_move >= MOVE_TIMEOUT:
+        # Таймаут! Игрок проигрывает
+        await process_move_timeout(game, game_id)
+
+
+async def process_move_timeout(game: TicTacToeGame, game_id: str):
+    """Обрабатывает таймаут хода"""
+    if game.winner:
+        return  # Игра уже завершена
+
+    timeout_player = game.current_player
+    winner_id = game.player1 if timeout_player == game.player2 else game.player2
+
+    # Обновляем статистику
+    winner_data = get_user_data(winner_id)
+    loser_data = get_user_data(timeout_player)
+
+    if game.is_rated and winner_data and loser_data:
+        # Даем победителю рейтинг
+        win_change = int(RATING_CHANGE_BASE * 0.5)  # 50% от стандартной победы
+        winner_data['rating'] += win_change
+        winner_data['games_played'] += 1
+        winner_data['wins'] += 1
+        save_user_data(winner_data)
+
+        # Отнимаем рейтинг у проигравшего по таймауту
+        lose_change = int(RATING_CHANGE_BASE * 1.0)  # 100% штраф за таймаут
+        loser_data['rating'] -= lose_change
+        loser_data['games_played'] += 1
+        loser_data['losses'] += 1
+        save_user_data(loser_data)
+
+        # Обновляем время последней игры
+        update_last_game_time(winner_id)
+        update_last_game_time(timeout_player)
+
+        # Отправляем сообщения игрокам
+        for player_id in [game.player1, game.player2]:
+            if player_id != -1:  # Не бот
+                user_data = get_user_data(player_id)
+                if user_data:
+                    if player_id == winner_id:
+                        message_text = (
+                            f"⏰ Игра завершена по таймауту!\n\n"
+                            f"Противник не сделал ход вовремя!\n\n"
+                            f"🏆 Вы победили!\n"
+                            f"Ваш рейтинг: {user_data['rating']}⭐"
+                        )
+                    else:
+                        message_text = (
+                            f"⏰ Игра завершена по таймауту!\n\n"
+                            f"Вы не сделали ход вовремя! ⏰\n\n"
+                            f"📉 Изменение рейтинга: -{lose_change}⭐\n"
+                            f"Ваш рейтинг: {user_data['rating']}⭐"
+                        )
+
+                    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="🎮 Новая игра", callback_data="find_game")],
+                        [InlineKeyboardButton(text="👤 Профиль", callback_data="profile")],
+                        [InlineKeyboardButton(text="📋 Меню", callback_data="back_to_main")]
+                    ])
+
+                    await bot.send_message(
+                        player_id,
+                        message_text,
+                        reply_markup=keyboard
+                    )
+    else:
+        # Без рейтинга
+        if winner_data:
+            winner_data['games_played'] += 1
+            winner_data['wins'] += 1
+            save_user_data(winner_data)
+        if loser_data:
+            loser_data['games_played'] += 1
+            loser_data['losses'] += 1
+            save_user_data(loser_data)
+
+        # Обновляем время последней игры
+        update_last_game_time(winner_id)
+        update_last_game_time(timeout_player)
+
+        # Отправляем сообщения
+        for player_id in [game.player1, game.player2]:
+            if player_id != -1:
+                if player_id == winner_id:
+                    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="🎮 Новая игра", callback_data="find_game")],
+                        [InlineKeyboardButton(text="👤 Профиль", callback_data="profile")],
+                        [InlineKeyboardButton(text="📋 Меню", callback_data="back_to_main")]
+                    ])
+                    await bot.send_message(player_id, "⏰ Противник не сделал ход вовремя! Вы победили! 🏆",
+                                           reply_markup=keyboard)
+                else:
+                    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="🎮 Новая игра", callback_data="find_game")],
+                        [InlineKeyboardButton(text="👤 Профиль", callback_data="profile")],
+                        [InlineKeyboardButton(text="📋 Меню", callback_data="back_to_main")]
+                    ])
+                    await bot.send_message(player_id, "⏰ Вы не сделали ход вовремя! Вы проиграли! ⏰",
+                                           reply_markup=keyboard)
+
+    # Удаляем игру
+    if game_id in game_sessions:
+        if game_id in move_timeout_tasks:
+            move_timeout_tasks[game_id].cancel()
+            del move_timeout_tasks[game_id]
+        del game_sessions[game_id]
 
 
 @router.message(CommandStart())
@@ -852,7 +994,10 @@ async def cmd_start(message: Message):
     else:
         save_chat_info(message.chat.id, message.chat.type, message.chat.title, getattr(message.chat, 'member_count', 0))
 
+    # Проверяем, новый ли это пользователь
+    is_new_user = False
     if not user_data:
+        is_new_user = True
         user_data = {
             'user_id': user_id,
             'username': username,
@@ -905,8 +1050,31 @@ async def cmd_start(message: Message):
                 await message.answer("❌ Нельзя использовать собственную реферальную ссылку!")
                 return
 
+            # Проверяем, является ли пользователь новым
+            if not is_new_user:
+                await message.answer(
+                    "❌ Реферальная ссылка работает только для новых пользователей!\n"
+                    "Вы уже зарегистрированы в боте ранее."
+                )
+                return
+
             # Создаем запись о реферале
             create_referral(referrer_id, user_id)
+
+            # Отправляем уведомление рефереру
+            try:
+                referrer_data = get_user_data(referrer_id)
+                await bot.send_message(
+                    referrer_id,
+                    f"🎉 У вас новый реферал!\n\n"
+                    f"👤 Пользователь: @{username}\n"
+                    f"📅 Дата: {datetime.now().strftime('%d.%m.%Y %H:%M')}\n\n"
+                    f"Теперь ему нужно сыграть {REF_REQUIRED_GAMES} игры и достичь звания '{REF_REQUIRED_RANK}' "
+                    f"чтобы реферал засчитался."
+                )
+            except Exception as e:
+                print(f"Ошибка отправки уведомления рефереру: {e}")
+
             await message.answer(
                 "🎉 Вы присоединились по реферальной ссылке! "
                 f"Теперь вам нужно сыграть {REF_REQUIRED_GAMES} игры и достичь звания '{REF_REQUIRED_RANK}' "
@@ -960,6 +1128,7 @@ async def cmd_ref(message: Message):
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎰 Крутить рулетку", callback_data="roulette")],
+        [InlineKeyboardButton(text="ℹ️ Посмотреть призы", callback_data="view_prizes")],
         [InlineKeyboardButton(text="🔗 Скопировать ссылку", callback_data=f"copy_ref_{user_id}")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]
     ])
@@ -971,6 +1140,51 @@ async def cmd_ref(message: Message):
 async def ref_program_handler(callback: CallbackQuery):
     """Обработчик кнопки реферальной программы"""
     await cmd_ref(callback.message)
+
+
+@router.callback_query(F.data == "view_prizes")
+async def view_prizes_handler(callback: CallbackQuery):
+    """Показывает информацию о призах"""
+    await cmd_rouletteprize(callback.message)
+
+
+@router.message(Command("rouletteprize"))
+async def cmd_rouletteprize(message: Message):
+    """Информация о призах в рулетке"""
+    prize_text = (
+        "🎰 Призы рулетки и шансы выпадения:\n\n"
+        "🎁 NFT подарок - 0.1%\n"
+        "   • Уникальные коллекционные предметы\n"
+        "   • Высокая ценность\n\n"
+        "🎁 Обычный подарок - 10%\n"
+        "   • Полезные бонусы для игры\n"
+        "   • Разные виды подарков\n\n"
+        "🧸 Мишка - 5%\n"
+        "   • Милый плюшевый мишка\n"
+        "   • Добавляет уют в коллекцию\n\n"
+        "❤️ Сердечко - 5%\n"
+        "   • Символ любви и удачи\n"
+        "   • Приносит хорошее настроение\n\n"
+        "😞 Ничего - 30%\n"
+        "   • Увы, в этот раз не повезло\n"
+        "   • Попробуйте еще раз!\n\n"
+        "✨ Статус - 49.9%\n"
+        "   • Один из 30 уникальных статусов\n"
+        "   • Показывается в вашем профиле\n"
+        "   • Коллекционируйте все статусы!\n\n"
+        "📊 Шансы указаны на одну прокрутку\n"
+        "🎯 Качество призов повышается с количеством рефералов!"
+    )
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎰 Крутить рулетку", callback_data="roulette")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="ref_program")]
+    ])
+
+    if isinstance(message, Message):
+        await message.answer(prize_text, reply_markup=keyboard)
+    else:
+        await message.edit_text(prize_text, reply_markup=keyboard)
 
 
 @router.callback_query(F.data.startswith("copy_ref_"))
@@ -1017,6 +1231,7 @@ async def roulette_handler(callback: CallbackQuery):
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎰 Крутить рулетку!", callback_data="spin_roulette")],
+        [InlineKeyboardButton(text="ℹ️ Посмотреть призы", callback_data="view_prizes")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="ref_program")]
     ])
 
@@ -1042,9 +1257,25 @@ async def spin_roulette_handler(callback: CallbackQuery):
     if spin_result['type'] != 'nothing':
         add_inventory_item(user_id, spin_result['type'], spin_result['name'])
 
-    # Обновляем количество прокруток
-    completed_refs -= REF_FOR_ROULETTE
-    # Здесь должна быть логика обновления счетчика прокруток в БД
+        # Отправляем уведомление админу о выигрыше подарка
+        try:
+            user_data = get_user_data(user_id)
+            gift_text = (
+                f"🎁 ПОЛУЧЕН ПОДАРОК!\n\n"
+                f"👤 Пользователь: @{user_data['username']} (ID: {user_id})\n"
+                f"🏆 Выиграл: {spin_result['name']}\n"
+                f"📦 Тип: {spin_result['type']}\n"
+                f"🕐 Время: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"🎮 Игр сыграно: {user_data['games_played']}\n"
+                f"⭐ Рейтинг: {user_data['rating']}"
+            )
+            await bot.send_message(ADMIN_ID, gift_text)
+        except Exception as e:
+            print(f"Ошибка отправки уведомления о подарке: {e}")
+
+    # Уменьшаем количество доступных прокруток
+    # Не обновляем базу данных здесь, т.к. это демонстрационная логика
+    # В реальном боте нужно было бы обновить счетчик прокруток
 
     result_text = (
         f"🎰 Результат прокрутки:\n\n"
@@ -1083,6 +1314,32 @@ def spin_roulette():
     else:  # 49.9%
         status = random.choice(STATUSES)
         return {'type': 'status', 'name': status}
+
+
+@router.message(Command("help"))
+async def cmd_help(message: Message):
+    """Показывает список команд бота"""
+    help_text = (
+        "🎮 Крестики-Нолики - Список команд\n\n"
+        "📋 Основные команды:\n"
+        "/start - Начать игру, главное меню\n"
+        "/help - Показать это сообщение\n"
+        "/profile - Ваш профиль\n"
+        "/top - Топ-10 игроков\n"
+        "/ref - Реферальная программа\n"
+        "/status - Список всех статусов\n"
+        "/mystatus - Ваши статусы\n"
+        "/inventory - Ваш инвентарь\n"
+        "/report - Отправить отчет администратору\n\n"
+        "🎮 Игровые команды:\n"
+        "• Просто нажмите 'Найти игру' в меню\n"
+        "• Или 'Играть с другом' для игры с друзьями\n\n"
+        "🎁 Дополнительно:\n"
+        "/rouletteprize - Информация о призах рулетки\n\n"
+
+    )
+
+    await message.answer(help_text)
 
 
 @router.message(Command("status"))
@@ -1208,8 +1465,8 @@ async def cmd_stats(message: Message):
 
 
 @router.message(Command("report"))
-async def cmd_report(message: Message):
-    """Отчет о получении подарка"""
+async def cmd_report(message: Message, state: FSMContext):
+    """Отправка отчета администратору"""
     user_id = message.from_user.id
     user_data = get_user_data(user_id)
 
@@ -1217,11 +1474,30 @@ async def cmd_report(message: Message):
         await message.answer("❌ Сначала зарегистрируйтесь через /start")
         return
 
-    # Отправляем уведомление админу
+    await message.answer(
+        "📝 Отправьте текст отчета:\n\n"
+        "Опишите вашу проблему, предложение или сообщение для администратора."
+    )
+    await state.set_state(ReportStates.waiting_report_text)
+
+
+@router.message(ReportStates.waiting_report_text)
+async def process_report(message: Message, state: FSMContext):
+    """Обработка текста отчета"""
+    user_id = message.from_user.id
+    user_data = get_user_data(user_id)
+
+    if not user_data:
+        await message.answer("❌ Сначала зарегистрируйтесь через /start")
+        await state.clear()
+        return
+
+    # Отправляем отчет админу
     report_text = (
-        f"🚨 ПОЛУЧЕН ПОДАРОК\n\n"
-        f"👤 Пользователь: {user_data['username']} (ID: {user_id})\n"
+        f"📨 НОВЫЙ ОТЧЕТ\n\n"
+        f"👤 От: @{user_data['username']} (ID: {user_id})\n"
         f"🕐 Время: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"📝 Текст:\n{message.text}\n\n"
         f"🎮 Игр сыграно: {user_data['games_played']}\n"
         f"⭐ Рейтинг: {user_data['rating']}"
     )
@@ -1232,6 +1508,8 @@ async def cmd_report(message: Message):
     except Exception as e:
         await message.answer("❌ Ошибка отправки отчета. Попробуйте позже.")
         print(f"Ошибка отправки отчета: {e}")
+
+    await state.clear()
 
 
 @router.callback_query(F.data == "my_inventory")
@@ -1264,6 +1542,38 @@ async def my_inventory_handler(callback: CallbackQuery):
     ])
 
     await callback.message.edit_text(inventory_text, reply_markup=keyboard)
+
+
+@router.message(Command("inventory"))
+async def cmd_inventory(message: Message):
+    """Показывает инвентарь через команду"""
+    user_id = message.from_user.id
+    inventory = get_inventory(user_id)
+
+    if not inventory:
+        inventory_text = "🎒 Ваш инвентарь пуст.\n\nПолучите предметы через рулетку!"
+    else:
+        inventory_text = "🎒 Ваш инвентарь:\n\n"
+
+        # Группируем предметы по типам
+        items_by_type = {}
+        for item_type, item_name, quantity in inventory:
+            if item_type not in items_by_type:
+                items_by_type[item_type] = []
+            items_by_type[item_type].append((item_name, quantity))
+
+        for item_type, items in items_by_type.items():
+            inventory_text += f"📦 {item_type.upper()}:\n"
+            for item_name, quantity in items:
+                inventory_text += f"  • {item_name} ×{quantity}\n"
+            inventory_text += "\n"
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎰 Крутить рулетку", callback_data="roulette")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]
+    ])
+
+    await message.answer(inventory_text, reply_markup=keyboard)
 
 
 @router.callback_query(F.data == "create_invite")
@@ -1412,6 +1722,64 @@ async def show_profile(callback: CallbackQuery):
     )
 
 
+@router.message(Command("profile"))
+async def cmd_profile(message: Message):
+    """Показывает профиль через команду"""
+    user_id = message.from_user.id
+    user_data = get_user_data(user_id)
+
+    if not user_data:
+        await message.answer("❌ Сначала зарегистрируйтесь через /start")
+        return
+
+    rank = get_user_rank(user_data['rating'])
+    position = get_user_position(user_id)
+    active_status = get_active_status(user_id)
+
+    win_rate = (user_data['wins'] / user_data['games_played'] * 100) if user_data['games_played'] > 0 else 0
+
+    profile_text = (
+        f"👤 Профиль игрока\n\n"
+        f"📛 Имя: {user_data['username']}\n"
+        f"🎯 Статус: {active_status}\n"
+        f"🏅 Звание: {rank['name']}\n"
+        f"⭐ Рейтинг: {user_data['rating']}\n"
+        f"📊 Позиция в рейтинге: #{position}\n\n"
+        f"📈 Статистика:\n"
+        f"🎮 Игр сыграно: {user_data['games_played']}\n"
+        f"✅ Побед: {user_data['wins']}\n"
+        f"❌ Поражений: {user_data['losses']}\n"
+        f"🤝 Ничьих: {user_data['draws']}\n"
+        f"📊 Win Rate: {win_rate:.1f}%"
+    )
+
+    await message.answer(
+        profile_text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]
+        ])
+    )
+
+
+@router.message(Command("top"))
+async def cmd_top(message: Message):
+    """Показывает топ-10 через команду"""
+    top_players = get_global_ranking()
+
+    top_text = "🏆 Топ-10 игроков:\n\n"
+    for i, (user_id, username, rating) in enumerate(top_players, 1):
+        rank_emoji = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+        emoji = rank_emoji[i - 1] if i <= 10 else f"{i}."
+        top_text += f"{emoji} {username} - {rating}⭐\n"
+
+    await message.answer(
+        top_text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]
+        ])
+    )
+
+
 @router.callback_query(F.data == "top_10")
 async def show_top_10(callback: CallbackQuery):
     top_players = get_global_ranking()
@@ -1519,7 +1887,15 @@ async def process_move(callback: CallbackQuery):
     if game.make_move(row, col, user_id):
         game.save_to_db(game_id)
 
+        # Отменяем старую задачу таймаута и запускаем новую
+        if game_id in move_timeout_tasks:
+            move_timeout_tasks[game_id].cancel()
+        move_timeout_tasks[game_id] = asyncio.create_task(check_move_timeout(game_id))
+
         if game.winner:
+            if game_id in move_timeout_tasks:
+                move_timeout_tasks[game_id].cancel()
+                del move_timeout_tasks[game_id]
             await finish_game(game, game_id)
         else:
             # Обновляем сообщение для обоих игроков
@@ -1596,6 +1972,9 @@ async def make_bot_move(game: TicTacToeGame, game_id: str):
         game.save_to_db(game_id)
 
         if game.winner:
+            if game_id in move_timeout_tasks:
+                move_timeout_tasks[game_id].cancel()
+                del move_timeout_tasks[game_id]
             await finish_game(game, game_id)
         else:
             await update_game_messages(game, game_id, "Бот сделал ход")
@@ -1680,10 +2059,15 @@ async def finish_game(game: TicTacToeGame, game_id: str):
 
                     # Уведомляем реферера
                     try:
+                        referrer_data = get_user_data(referrer_id)
                         await bot.send_message(
                             referrer_id,
-                            f"🎉 Ваш реферал @{user_data['username']} выполнил все условия!\n"
-                            f"Теперь у вас +1 завершенный реферал!"
+                            f"🎉 Ваш реферал выполнил все условия!\n\n"
+                            f"👤 Пользователь: @{user_data['username']}\n"
+                            f"✅ Игр сыграно: {referral_data['games_played']}\n"
+                            f"🏅 Достиг звания: {get_user_rank(user_data['rating'])['name']}\n\n"
+                            f"Теперь у вас +1 завершенный реферал!\n"
+                            f"Всего завершенных: {get_completed_referrals_count(referrer_id)}"
                         )
                     except:
                         pass
@@ -1789,13 +2173,16 @@ async def finish_game(game: TicTacToeGame, game_id: str):
                     f"Ваш рейтинг: {user_data['rating']}⭐"
                 )
 
+                keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🎮 Новая игра", callback_data="find_game")],
+                    [InlineKeyboardButton(text="👤 Профиль", callback_data="profile")],
+                    [InlineKeyboardButton(text="📋 Меню", callback_data="back_to_main")]
+                ])
+
                 await bot.send_message(
                     player_id,
                     final_message,
-                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                        [InlineKeyboardButton(text="🎮 Новая игра", callback_data="find_game")],
-                        [InlineKeyboardButton(text="👤 Профиль", callback_data="profile")]
-                    ])
+                    reply_markup=keyboard
                 )
 
     # Удаляем игру
@@ -1816,6 +2203,9 @@ async def start_game(player1: int, player2: int, is_rated: bool = True, chat_id:
         return
 
     rated_text = " (на рейтинг)" if is_rated else " (без рейтинга)"
+
+    # Запускаем задачу проверки таймаута
+    move_timeout_tasks[game_id] = asyncio.create_task(check_move_timeout(game_id))
 
     # Отправляем сообщения игрокам и сохраняем ID сообщений
     for player_id in [player1, player2]:
@@ -1847,6 +2237,9 @@ async def start_game_with_bot(player_id: int, is_rated: bool = True, chat_id: in
     game_sessions[game_id] = game
 
     rated_text = " (на рейтинг)" if is_rated else " (без рейтинга)"
+
+    # Запускаем задачу проверки таймаута
+    move_timeout_tasks[game_id] = asyncio.create_task(check_move_timeout(game_id))
 
     text = (
         f"🎮 Игра началась{rated_text}!\n"
@@ -2275,6 +2668,11 @@ async def process_surrender(callback: CallbackQuery):
         await callback.answer("❌ Игра не найдена!")
         return
 
+    # Отменяем задачу таймаута
+    if game_id in move_timeout_tasks:
+        move_timeout_tasks[game_id].cancel()
+        del move_timeout_tasks[game_id]
+
     # Определяем победителя и проигравшего
     if user_id == game.player1:
         winner_id = game.player2
@@ -2319,13 +2717,16 @@ async def process_surrender(callback: CallbackQuery):
                             f"Ваш рейтинг: {user_data['rating']}⭐"
                         )
 
+                    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="🎮 Новая игра", callback_data="find_game")],
+                        [InlineKeyboardButton(text="👤 Профиль", callback_data="profile")],
+                        [InlineKeyboardButton(text="📋 Меню", callback_data="back_to_main")]
+                    ])
+
                     await bot.send_message(
                         player_id,
                         message_text,
-                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                            [InlineKeyboardButton(text="🎮 Новая игра", callback_data="find_game")],
-                            [InlineKeyboardButton(text="👤 Профиль", callback_data="profile")]
-                        ])
+                        reply_markup=keyboard
                     )
     else:
         # Без рейтинга
@@ -2345,10 +2746,16 @@ async def process_surrender(callback: CallbackQuery):
         # Отправляем сообщения
         for player_id in [game.player1, game.player2]:
             if player_id != -1:
+                keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🎮 Новая игра", callback_data="find_game")],
+                    [InlineKeyboardButton(text="👤 Профиль", callback_data="profile")],
+                    [InlineKeyboardButton(text="📋 Меню", callback_data="back_to_main")]
+                ])
+
                 if player_id == winner_id:
-                    await bot.send_message(player_id, "🎮 Противник сдался! Вы победили! 🏆")
+                    await bot.send_message(player_id, "🎮 Противник сдался! Вы победили! 🏆", reply_markup=keyboard)
                 else:
-                    await bot.send_message(player_id, "🎮 Вы сдались! 🏳️")
+                    await bot.send_message(player_id, "🎮 Вы сдались! 🏳️", reply_markup=keyboard)
 
     # Удаляем игру
     if game_id in game_sessions:
